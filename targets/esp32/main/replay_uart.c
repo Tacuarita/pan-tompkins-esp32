@@ -1,4 +1,5 @@
 #include "replay_ring.h"
+#include "pan_tompkins.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -30,8 +31,18 @@ typedef enum {
 } TrialMode;
 
 typedef struct {
+    PtDetector detector;
+    PtCandidate *candidates;
+    size_t candidate_count;
+} Lead;
+
+typedef struct {
+    Lead leads[LEADS_PER_WORKER];
+    size_t candidate_capacity;
+    bool candidate_overflow;
     unsigned id;
     bool stalled;
+    int core;
     TaskHandle_t task;
     uint32_t frames;
     uint32_t index_errors;
@@ -46,6 +57,7 @@ static SemaphoreHandle_t workers_done;
 static void replay_worker(void *argument)
 {
     Worker *worker = argument;
+    worker->core = xPortGetCoreID();
     bool stopping;
     do {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -54,10 +66,21 @@ static void replay_worker(void *argument)
         while (!worker->stalled && (frame = replay_ring_peek(&ring, worker->id)) != NULL) {
             worker->index_errors += frame->index != worker->frames;
             uint8_t triplet[2 * LEADS_PER_WORKER];
-            for (unsigned lead = 0; lead < LEADS_PER_WORKER; ++lead) {
-                uint16_t code = frame->samples[worker->id * LEADS_PER_WORKER + lead];
-                triplet[2 * lead] = code & 0xff;
-                triplet[2 * lead + 1] = code >> 8;
+            for (unsigned lane = 0; lane < LEADS_PER_WORKER; ++lane) {
+                int16_t sample = frame->samples[worker->id * LEADS_PER_WORKER + lane];
+                uint16_t code = (uint16_t)sample;
+                triplet[2 * lane] = code & 0xff;
+                triplet[2 * lane + 1] = code >> 8;
+
+                Lead *lead = &worker->leads[lane];
+                PtCandidate candidate;
+                if (pt_process(&lead->detector, sample, &candidate)) {
+                    if (lead->candidate_count == worker->candidate_capacity) {
+                        worker->candidate_overflow = true;
+                    } else {
+                        lead->candidates[lead->candidate_count++] = candidate;
+                    }
+                }
             }
             worker->crc = esp_rom_crc32_le(worker->crc, triplet, sizeof(triplet));
             ++worker->frames;
@@ -109,17 +132,57 @@ static bool wait_for_prefill(uint32_t frames)
     return false;
 }
 
-static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode)
+static void write_candidates(void)
 {
+    char line[80];
+    snprintf(line, sizeof(line), "PLACEMENT %d %d %d\n",
+             (int)xPortGetCoreID(), workers[0].core, workers[1].core);
+    write_line(line);
+    for (unsigned id = 0; id < WORKER_COUNT; ++id) {
+        for (unsigned lane = 0; lane < LEADS_PER_WORKER; ++lane) {
+            const Lead *lead = &workers[id].leads[lane];
+            for (size_t index = 0; index < lead->candidate_count; ++index) {
+                PtCandidate candidate = lead->candidates[index];
+                snprintf(line, sizeof(line), "CANDIDATE %u %" PRIu32 " %" PRIu32 "\n",
+                         id * LEADS_PER_WORKER + lane, candidate.beat_location,
+                         candidate.production_frame);
+                write_line(line);
+            }
+        }
+    }
+}
+
+static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, bool parity)
+{
+    uint32_t max_frames = count;
+    if (mode == INJECT_UNDERRUN) {
+        max_frames = 1;
+    } else if (mode == INJECT_OVERFLOW) {
+        max_frames = RING_CAPACITY;
+    }
+    // Accepted locations are inside the replay and separated by at least the refractory interval.
+    size_t capacity = 1 + (max_frames - 1) / PT_REFRACTORY_SAMPLES;
+    PtCandidate *candidates = calloc(FRAME_LEADS * capacity, sizeof(*candidates));
+    if (candidates == NULL) {
+        write_line("ERROR CANDIDATE_STORAGE\n");
+        return;
+    }
+
     replay_ring_reset(&ring);
     atomic_store_explicit(&stop_workers, false, memory_order_relaxed);
     memset(workers, 0, sizeof(workers));
     for (unsigned id = 0; id < WORKER_COUNT; ++id) {
         workers[id].id = id;
         workers[id].stalled = mode == INJECT_OVERFLOW && id == 1;
+        workers[id].candidate_capacity = capacity;
+        for (unsigned lane = 0; lane < LEADS_PER_WORKER; ++lane) {
+            workers[id].leads[lane].candidates =
+                &candidates[(id * LEADS_PER_WORKER + lane) * capacity];
+        }
         BaseType_t created = xTaskCreatePinnedToCore(replay_worker, "lead_worker",
                                                      WORKER_STACK_BYTES, &workers[id],
-                                                     WORKER_PRIORITY, &workers[id].task, 1);
+                                                     WORKER_PRIORITY, &workers[id].task,
+                                                     id == 0 ? 1 : SECOND_WORKER_CORE);
         if (created != pdPASS) {
             abort();
         }
@@ -188,6 +251,9 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode)
     }
     for (unsigned id = 0; id < WORKER_COUNT; ++id) {
         vTaskDelete(workers[id].task);
+        if (workers[id].candidate_overflow) {
+            result = "CANDIDATE_OVERFLOW";
+        }
     }
 
     char summary[256];
@@ -198,6 +264,10 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode)
              workers[0].frames, workers[0].index_errors, workers[0].crc,
              workers[1].frames, workers[1].index_errors, workers[1].crc);
     ESP_ERROR_CHECK(uart_flush_input(REPLAY_UART));
+    if (parity && strcmp(result, "OK") == 0) {
+        write_candidates();
+    }
+    free(candidates);
     write_line(summary);
 }
 
@@ -219,11 +289,13 @@ static void handle_command(esp_timer_handle_t timer, const char *command)
         return;
     }
     if (strcmp(end, " normal") == 0) {
-        run_trial(timer, count, NORMAL);
+        run_trial(timer, count, NORMAL, false);
+    } else if (strcmp(end, " parity") == 0) {
+        run_trial(timer, count, NORMAL, true);
     } else if (count >= 2 && strcmp(end, " underrun") == 0) {
-        run_trial(timer, count, INJECT_UNDERRUN);
+        run_trial(timer, count, INJECT_UNDERRUN, false);
     } else if (count > RING_CAPACITY && strcmp(end, " overflow") == 0) {
-        run_trial(timer, count, INJECT_OVERFLOW);
+        run_trial(timer, count, INJECT_OVERFLOW, false);
     }
 }
 
