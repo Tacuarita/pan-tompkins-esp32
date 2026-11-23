@@ -299,6 +299,7 @@ def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_
     placement = None
     candidates = [[] for _ in LEADS]
     fusion_report = None
+    memory = None
     fused = []
     for reply in replies:
         if raw_reports is not None and not reply.startswith(b"GRANT "):
@@ -329,6 +330,13 @@ def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_
                 verified_fusion = fusion_report, fused
             if timing is not None:
                 summary = timing.summarize(reply, fused, fusion_report, config)
+                if memory is not None:
+                    heap, replay, worker1, worker2, fusion_stack = memory
+                    summary["min_internal_heap_bytes"] = heap
+                    summary["stack_headroom_bytes"] = {
+                        "replay": replay, "worker1": worker1, "worker2": worker2,
+                        "fusion": fusion_stack,
+                    }
                 if delayed and timing.detailed and summary["deadline_misses"] == 0:
                     raise ValueError("injected delay did not cause a scored deadline miss")
                 if mode == "overflow" and timing.detailed and timing.start == 0:
@@ -365,6 +373,11 @@ def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_
             if fusion_report is None or len(fields) != 1:
                 raise ValueError(f"unexpected fused beat: {reply!r}")
             fused.append(int(fields[0]))
+        elif timing is not None and timing.detailed and reply.startswith(b"MEMORY "):
+            fields = reply.split()[1:]
+            if memory is not None or len(fields) != 5 or not all(field.isdigit() for field in fields):
+                raise ValueError(f"invalid memory report: {reply!r}")
+            memory = tuple(map(int, fields))
         elif timing is not None and reply and reply.split(maxsplit=1)[0] in (b"TIMING", b"CPU", b"FRAME", b"BEAT"):
             timing.accept(reply)
         elif reply not in READY:

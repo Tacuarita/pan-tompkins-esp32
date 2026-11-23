@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "driver/uart.h"
+#include "esp_heap_caps.h"
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -332,6 +333,10 @@ static void write_timing(const TrialTiming *timing, const FusionTrial *fusion, u
 static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, ReportMode report,
                       const ScoreWindow *window)
 {
+    bool measure_memory = window != NULL && window->detailed;
+    if (measure_memory) {
+        ESP_ERROR_CHECK(heap_caps_monitor_local_minimum_free_size_start());
+    }
     uint32_t max_frames = count;
     if (mode == INJECT_UNDERRUN) {
         max_frames = 1;
@@ -355,6 +360,9 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
     };
     if (candidates == NULL || fusion.locations == NULL
         || (window != NULL && window->detailed && (timing.frames == NULL || fusion.beats == NULL))) {
+        if (measure_memory) {
+            ESP_ERROR_CHECK(heap_caps_monitor_local_minimum_free_size_stop());
+        }
         free(timing.frames);
         free(fusion.beats);
         free(candidates);
@@ -494,7 +502,6 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
         xSemaphoreTake(workers_done, portMAX_DELAY);
     }
     for (unsigned id = 0; id < WORKER_COUNT; ++id) {
-        vTaskDelete(workers[id].task);
         if (workers[id].candidate_overflow) {
             result = "CANDIDATE_OVERFLOW";
         }
@@ -502,6 +509,23 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
     // The final fusion pass must see every real frame the workers drained.
     xTaskNotify(fusion_task, FUSION_STOP, eSetBits);
     xSemaphoreTake(workers_done, portMAX_DELAY);
+
+    if (measure_memory) {
+        size_t min_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_ERROR_CHECK(heap_caps_monitor_local_minimum_free_size_stop());
+        // Completed tasks have stopped writing replay data and still own their stacks.
+        unsigned worker1 = uxTaskGetStackHighWaterMark(workers[0].task);
+        unsigned worker2 = uxTaskGetStackHighWaterMark(workers[1].task);
+        unsigned fusion_stack = uxTaskGetStackHighWaterMark(fusion_task);
+        unsigned replay = uxTaskGetStackHighWaterMark(NULL);
+        char memory[128];
+        snprintf(memory, sizeof(memory), "MEMORY %zu %u %u %u %u\n",
+                 min_heap, replay, worker1, worker2, fusion_stack);
+        write_line(memory);
+    }
+    for (unsigned id = 0; id < WORKER_COUNT; ++id) {
+        vTaskDelete(workers[id].task);
+    }
     vTaskDelete(fusion_task);
 
     char summary[256];
