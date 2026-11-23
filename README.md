@@ -8,3 +8,5 @@ This experiment replays six synchronized PhysioNet INCART ECG leads at 257 Hz on
 - `GLOSSARY.md` defines the detector, fusion, and timing terms.
 - `tools/` is for host-side replay preparation and verification.
 - `data/` is for local source records, host annotations, and generated replay files.
+
+See [INCART beat scoring](docs/incart-scoring.md) to reproduce the ten-minute host pilot.
