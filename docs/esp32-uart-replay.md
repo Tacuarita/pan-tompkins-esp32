@@ -92,3 +92,44 @@ overflow RESULT RING_OVERFLOW 64 249027 249063 61 64 0 163d8865 0 0 00000000
 ```
 
 The host's scalar stage and decision tests and concurrent ring regression also passed with GCC undefined-behavior traps enabled. The offline Lead I replay matched the committed fixture. The changed firmware translation unit and its detector dependency are C. Both ESP32 builds exported compilation databases, and the repository's clang-tidy requirement for C++ changes did not apply.
+
+## Two-lead fusion
+
+The fusion task runs on core 0 at priority 4. Each worker appends every candidate to its lead's parity log before advancing its frame cursor. Fusion takes the smaller of the two cursors and considers candidates handed off through that common input frame. It counts candidates with production delay greater than `H` and excludes those candidates from grouping.
+
+Fusion selects the earliest unassigned eligible location `a`. Once both workers have completed `a + W + H` inclusive, it consumes the eligible candidates in `[a, a + W]` and retains a beat at `a` if two distinct leads contributed. At the end of input it processes the final real worker progress. To score a full window, supply at least `W + H` real post-roll frames. [Fusion decision](adr/0002-finalize-fusion-by-input-frame.md)
+
+The firmware uses provisional pilot settings of `W = 13` samples (about 51 ms) and `H = 128` samples (about 498 ms). On I01, 262 of the 275 scalar candidates are within that production-delay limit. Freeze the settings during the pilot before scoring held-out recordings.
+
+### Verification
+
+Run the host boundary regression from the repository root.
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=undefined \
+  -fsanitize-undefined-trap-on-error -Isrc -Itargets/esp32/main \
+  tests/beat_fusion_test.c src/beat_fusion.c targets/esp32/main/replay_ring.c \
+  -o /tmp/beat_fusion_test
+/tmp/beat_fusion_test
+```
+
+The regression covers delay boundaries `H` and `H + 1`, group boundaries `W` and `W + 1`, distinct-lead confirmation, one-time assignment, late arrival of an earlier location, the inclusive finalization frame, and either worker trailing the other. It also checks zero-width groups and cutoff arithmetic near the maximum frame index.
+
+Use the scalar A/B build and flash commands above, and add `--verify-fusion --delay-fusion-handoffs` to the UART sender command for each build. The sender checks every per-lead candidate, including all late candidates, then checks the board's late count and exact fused sequence against an independent offline grouping of the reference candidates. The delayed replay inserts a 12 ms task delay on each candidate-producing frame of worker 2 before it advances its cursor. The sender checks the number of injected delays and compares output across the two runs. Compare the reported settings and sequence SHA-256 across placements as well.
+
+Fusion verification extends the parity output with `FUSION <W> <H> <late-count> <delayed-handoffs>` followed by one `FUSED <location>` line per beat in ascending replay-relative frame order. The sender hashes the decimal locations as ASCII, one newline-terminated location per beat.
+
+### I01 fusion hardware results
+
+On 2026-11-23, both ESP-IDF 5.5.1 builds passed on the same ESP32-S3 revision v0.2 with byte-identical SDK configurations. In each run, both workers consumed all 7,710 canonical I01 frames in order, with triplet CRCs `94341788` and `e291ca01`. Every run matched all 275 offline candidates by lead, beat location, and production frame.
+
+| Configuration | Worker cores | Injected delayed handoffs | Late candidates | Fused beats |
+| --- | --- | ---: | ---: | ---: |
+| A | 1, 1 | 0 | 13 | 66 |
+| A | 1, 1 | 139 | 13 | 66 |
+| B | 1, 0 | 0 | 13 | 66 |
+| B | 1, 0 | 139 | 13 | 66 |
+
+All four runs matched the offline fused sequence exactly. Its SHA-256 was `0eefd555f2c2e1946ef02c2359ff2e7096f4bf7e491f1de36028a3fb93cdc6ea`. Both builds also passed the deliberate input-underrun and ring-overflow trials. The prior flash contents were restored and verified byte-for-byte by readback.
+
+The app image SHA-256 was `4a09a451cfdc890b7eefa5a59efc12badf60cb61f004ed0897deb4d7b4bd51ab` for A and `8aa0907a36400de1a9443c83f9070f3e2ba40abdaeee070d2cf18688532360e8` for B. Both builds exported compilation databases. This pass changed C and Python, so the C++ clang-tidy workflow did not apply.

@@ -47,3 +47,10 @@ void replay_ring_finish(ReplayRing *ring, unsigned worker)
     // Permit reuse only once this worker has completed every access to the slot.
     atomic_store_explicit(&ring->consumed[worker], index + 1, memory_order_release);
 }
+
+uint32_t replay_ring_completed(const ReplayRing *ring)
+{
+    uint32_t first = atomic_load_explicit(&ring->consumed[0], memory_order_acquire);
+    uint32_t second = atomic_load_explicit(&ring->consumed[1], memory_order_acquire);
+    return first < second ? first : second;
+}

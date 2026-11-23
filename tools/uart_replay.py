@@ -89,6 +89,58 @@ def verify_parity(config, placement, actual, expected):
     print(f"configuration {config} placement {placement}, exact candidate parity ({counts})")
 
 
+def offline_fusion(candidates, frames, window, max_delay):
+    eligible = []
+    late = 0
+    for lead, rows in enumerate(candidates):
+        for location, production in rows:
+            if production - location > max_delay:
+                late += 1
+            else:
+                eligible.append((location, lead))
+    eligible.sort()
+
+    locations = []
+    index = 0
+    while index < len(eligible):
+        anchor = eligible[index][0]
+        end = anchor + window
+        if end + max_delay >= frames:
+            break
+        leads = set()
+        while index < len(eligible) and eligible[index][0] <= end:
+            leads.add(eligible[index][1])
+            index += 1
+        if len(leads) >= 2:
+            locations.append(anchor)
+    return late, locations
+
+
+def verify_fusion(config, report, locations, reference, frames, delayed):
+    if report is None:
+        raise ValueError("board did not report fusion")
+    window, max_delay, late, handoffs = report
+    expected_late, expected_locations = offline_fusion(reference, frames, window, max_delay)
+    expected_handoffs = len({frame for rows in reference[3:] for _, frame in rows}) if delayed else 0
+    if (late, handoffs) != (expected_late, expected_handoffs):
+        raise ValueError(f"fusion count mismatch: expected {expected_late} late and "
+                         f"{expected_handoffs} delayed handoffs, observed {late} and {handoffs}")
+    if delayed and handoffs == 0:
+        raise ValueError("this excerpt did not exercise a delayed handoff")
+    if locations != expected_locations:
+        for index, (board, offline) in enumerate(zip(locations, expected_locations), 1):
+            if board != offline:
+                raise ValueError(f"fused beat {index} differs: board {board}, offline {offline}")
+        raise ValueError(f"fused beat count differs: board {len(locations)}, "
+                         f"offline {len(expected_locations)}")
+
+    sequence = "".join(f"{location}\n" for location in locations).encode("ascii")
+    digest = hashlib.sha256(sequence).hexdigest()
+    print(f"configuration {config} fusion W={window} H={max_delay}, {len(locations)} beats, "
+          f"{late} late candidates, {handoffs} delayed handoffs, SHA-256 {digest}")
+    return window, max_delay, locations
+
+
 def configure_port(port):
     fcntl.ioctl(port, termios.TIOCEXCL)
     tty.setraw(port)
@@ -182,17 +234,19 @@ def verify_result(report, mode, payload, sent):
             raise ValueError(f"{mode} worker {worker + 1} frame count, order or CRC mismatch")
 
 
-def run_trial(port, replies, mode, payload, config=None, reference=None):
+def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_trial=None):
     count = len(payload) // FRAME_BYTES
     send_limit = {"normal": count, "underrun": 1, "overflow": RING_CAPACITY + 1}[mode]
     if count < send_limit or (mode == "underrun" and count < 2):
         raise ValueError(f"excerpt has too few frames for {mode}")
 
-    trial = "parity" if config else mode
+    trial = fusion_trial or ("parity" if config else mode)
     write_all(port, f"START {count} {trial}\n".encode("ascii"))
     sent = 0
     placement = None
     candidates = [[] for _ in LEADS]
+    fusion_report = None
+    fused = []
     for reply in replies:
         if reply.startswith(b"GRANT "):
             fields = reply.split()
@@ -209,6 +263,9 @@ def run_trial(port, replies, mode, payload, config=None, reference=None):
             verify_result(reply, mode, payload, sent)
             if config:
                 verify_parity(config, placement, candidates, reference)
+            if fusion_trial:
+                return verify_fusion(config, fusion_report, fused, reference, count,
+                                     fusion_trial == "fusion-delay")
             return
         elif config and reply.startswith(b"PLACEMENT "):
             if sent != count or placement is not None:
@@ -216,9 +273,22 @@ def run_trial(port, replies, mode, payload, config=None, reference=None):
             placement = tuple(map(int, reply.split()[1:]))
         elif config and reply.startswith(b"CANDIDATE "):
             lead, location, frame = map(int, reply.split()[1:])
-            if placement is None or not 0 <= lead < len(LEADS) or not 0 <= location <= frame < count:
+            if (placement is None or fusion_report is not None or not 0 <= lead < len(LEADS)
+                    or not 0 <= location <= frame < count):
                 raise ValueError(f"invalid board candidate: {reply!r}")
             candidates[lead].append((location, frame))
+        elif fusion_trial and reply.startswith(b"FUSION "):
+            fields = reply.split()[1:]
+            if placement is None or fusion_report is not None or len(fields) != 4:
+                raise ValueError(f"unexpected fusion report: {reply!r}")
+            fusion_report = tuple(map(int, fields))
+            if min(fusion_report) < 0:
+                raise ValueError(f"negative fusion parameter or count: {reply!r}")
+        elif fusion_trial and reply.startswith(b"FUSED "):
+            fields = reply.split()[1:]
+            if fusion_report is None or len(fields) != 1:
+                raise ValueError(f"unexpected fused beat: {reply!r}")
+            fused.append(int(fields[0]))
         elif reply != b"READY 1":
             raise ValueError(f"unexpected UART reply: {reply!r}")
     raise TimeoutError("ESP32-S3 stopped responding on UART")
@@ -231,11 +301,19 @@ def main():
     parser.add_argument("--mode", choices=(*MODES, "all"), default="normal")
     parser.add_argument("--configuration", choices=PLACEMENTS, help="verify the board's scalar placement")
     parser.add_argument("--scalar-replay", type=Path, help="host scalar replay executable for exact parity")
+    parser.add_argument("--verify-fusion", action="store_true",
+                        help="compare board fusion with the offline candidates")
+    parser.add_argument("--delay-fusion-handoffs", action="store_true",
+                        help="repeat fusion verification with delayed handoffs from worker 2")
     args = parser.parse_args()
     if bool(args.configuration) != bool(args.scalar_replay):
         parser.error("--configuration and --scalar-replay must be supplied together")
     if args.configuration and args.mode not in ("normal", "all"):
         parser.error("candidate parity requires a complete normal replay")
+    if args.verify_fusion and not args.configuration:
+        parser.error("--verify-fusion requires candidate parity options")
+    if args.delay_fusion_handoffs and not args.verify_fusion:
+        parser.error("--delay-fusion-handoffs requires --verify-fusion")
 
     try:
         payload, payload_path = load_payload(args.manifest)
@@ -247,7 +325,12 @@ def main():
             replies = board_lines(port)
             for mode in MODES if args.mode == "all" else (args.mode,):
                 config = args.configuration if mode == "normal" else None
-                run_trial(port, replies, mode, payload, config, reference)
+                fusion_trial = "fusion" if config and args.verify_fusion else None
+                normal = run_trial(port, replies, mode, payload, config, reference, fusion_trial)
+                if config and args.delay_fusion_handoffs:
+                    delayed = run_trial(port, replies, mode, payload, config, reference, "fusion-delay")
+                    if normal != delayed:
+                        raise ValueError("fusion parameters or output changed after delaying handoffs")
         finally:
             os.close(port)
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:

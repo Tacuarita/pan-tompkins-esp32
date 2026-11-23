@@ -4,6 +4,7 @@ if(NOT SECOND_WORKER_CORE MATCHES "^[01]$")
 endif()
 
 idf_component_register(SRCS replay_uart.c replay_ring.c ../../../src/pan_tompkins.c
+                            ../../../src/beat_fusion.c
                        INCLUDE_DIRS .
                        PRIV_INCLUDE_DIRS ../../../src
                        PRIV_REQUIRES esp_driver_uart esp_timer esp_rom)

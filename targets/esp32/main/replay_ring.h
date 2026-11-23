@@ -28,3 +28,4 @@ void replay_ring_reset(ReplayRing *ring);
 bool replay_ring_publish(ReplayRing *ring, const uint8_t bytes[FRAME_BYTES]);
 const ReplayFrame *replay_ring_peek(const ReplayRing *ring, unsigned worker);
 void replay_ring_finish(ReplayRing *ring, unsigned worker);
+uint32_t replay_ring_completed(const ReplayRing *ring);
