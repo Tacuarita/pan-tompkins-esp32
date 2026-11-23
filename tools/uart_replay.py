@@ -2,6 +2,7 @@
 """Send a canonical INCART excerpt to the ESP32-S3 and verify its replay report."""
 
 import argparse
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import json
@@ -15,10 +16,10 @@ import time
 import tty
 import zlib
 
+from replay_timing import RATE_HZ, RING_CAPACITY, TimingReport
+
 FRAME_BYTES = 12
 TRIPLET_BYTES = FRAME_BYTES // 2
-RATE_HZ = 257
-RING_CAPACITY = 64
 MODES = ("normal", "underrun", "overflow")
 LEADS = ("I", "II", "III", "aVR", "aVL", "aVF")
 PLACEMENTS = {"A": (0, 1, 1), "B": (0, 1, 0)}
@@ -199,21 +200,31 @@ def triplet_crc(payload, worker, frames):
     return crc
 
 
-def verify_result(report, mode, payload, sent):
+def verify_result(report, mode, payload, sent, measured=False):
     count = len(payload) // FRAME_BYTES
     expected = {
         "normal": ("OK", count, count, (count, count)),
         "underrun": ("INPUT_UNDERRUN", 1, 1, (1, 1)),
         "overflow": ("RING_OVERFLOW", RING_CAPACITY, RING_CAPACITY + 1, (RING_CAPACITY, 0)),
     }
-    expected_status, expected_published, expected_sent, expected_workers = expected[mode]
     fields = report.split()
-    if len(fields) != 12 or fields[1].decode("ascii") != expected_status:
-        raise ValueError(f"{mode} expected {expected_status}, received {report!r}")
+    if len(fields) != 12:
+        raise ValueError(f"invalid board result: {report!r}")
+    status = fields[1].decode("ascii")
     published, scheduled, actual, max_late = map(int, fields[2:6])
-    if (published, sent) != (expected_published, expected_sent):
-        raise ValueError(f"{mode} published or sent frame count differs from expected")
-    last_release = published - 1 if mode == "normal" else published
+    expected_status, expected_published, expected_sent, expected_workers = expected[mode]
+    unexpected_abort = measured and mode == "normal" and status in (
+        "INPUT_UNDERRUN", "RING_OVERFLOW", "PREFILL_TIMEOUT", "CANDIDATE_OVERFLOW"
+    )
+    if unexpected_abort:
+        max_published = count if status == "CANDIDATE_OVERFLOW" else count - 1
+        if not 0 <= published <= min(max_published, sent) or not sent <= count:
+            raise ValueError(f"inconsistent frame counts in aborted replay: {report!r}")
+        expected_workers = (published, published)
+    elif status != expected_status or (published, sent) != (expected_published, expected_sent):
+        raise ValueError(f"{mode} expected {expected_status} and its frame counts, received {report!r}")
+
+    last_release = published if status in ("INPUT_UNDERRUN", "RING_OVERFLOW") else max(0, published - 1)
     if (
         scheduled != last_release * 1_000_000 // RATE_HZ
         or max_late < 0
@@ -221,7 +232,7 @@ def verify_result(report, mode, payload, sent):
         or abs(actual - scheduled) > max_late
     ):
         raise ValueError(f"{mode} inconsistent board timestamps")
-    if mode == "normal" and max_late >= 1_000_000 // RATE_HZ:
+    if mode == "normal" and not measured and max_late >= 1_000_000 // RATE_HZ:
         raise ValueError("a normal replay release was at least one frame period late")
 
     for worker, expected_frames in enumerate(expected_workers):
@@ -232,22 +243,31 @@ def verify_result(report, mode, payload, sent):
         expected_crc = triplet_crc(payload, worker, expected_frames)
         if (frames, index_errors, observed_crc) != (expected_frames, 0, expected_crc):
             raise ValueError(f"{mode} worker {worker + 1} frame count, order or CRC mismatch")
+    return not unexpected_abort
 
 
-def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_trial=None):
+def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_trial=None,
+              timing=None, delayed=False, raw_reports=None):
     count = len(payload) // FRAME_BYTES
     send_limit = {"normal": count, "underrun": 1, "overflow": RING_CAPACITY + 1}[mode]
     if count < send_limit or (mode == "underrun" and count < 2):
         raise ValueError(f"excerpt has too few frames for {mode}")
 
     trial = fusion_trial or ("parity" if config else mode)
-    write_all(port, f"START {count} {trial}\n".encode("ascii"))
+    if timing is None:
+        command = f"START {count} {trial}"
+    else:
+        detail = "on" if timing.detailed else "off"
+        command = f"MEASURE {count} {timing.start} {timing.end} {detail} {'delay' if delayed else mode}"
+    write_all(port, f"{command}\n".encode("ascii"))
     sent = 0
     placement = None
     candidates = [[] for _ in LEADS]
     fusion_report = None
     fused = []
     for reply in replies:
+        if raw_reports is not None and not reply.startswith(b"GRANT "):
+            raw_reports.write(reply.decode("ascii") + "\n")
         if reply.startswith(b"GRANT "):
             fields = reply.split()
             if len(fields) != 2:
@@ -260,35 +280,58 @@ def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_
             sent = end
         elif reply.startswith(b"RESULT "):
             print(f"{mode} {reply.decode('ascii')}", flush=True)
-            verify_result(reply, mode, payload, sent)
-            if config:
+            expected_result = verify_result(reply, mode, payload, sent, measured=timing is not None)
+            if config and expected_result:
                 verify_parity(config, placement, candidates, reference)
+            verified_fusion = None
+            if expected_result and (fusion_trial or (timing is not None and reference is not None
+                                                     and mode == "normal")):
+                verified_fusion = verify_fusion(config, fusion_report, fused, reference, count,
+                                                delayed or fusion_trial == "fusion-delay")
+            elif timing is not None and expected_result and mode == "normal":
+                if fusion_report is None:
+                    raise ValueError("board did not report fusion")
+                verified_fusion = fusion_report, fused
+            if timing is not None:
+                summary = timing.summarize(reply, fused, fusion_report, config)
+                if delayed and timing.detailed and summary["deadline_misses"] == 0:
+                    raise ValueError("injected delay did not cause a scored deadline miss")
+                if mode == "overflow" and timing.detailed and timing.start == 0:
+                    if timing.end >= RING_CAPACITY and summary["peak_backlog"] != RING_CAPACITY:
+                        raise ValueError("overflow did not saturate the replay ring")
+                    if timing.end == RING_CAPACITY and summary["end_backlog"] != RING_CAPACITY:
+                        raise ValueError("overflow boundary did not retain the full ring backlog")
+                print(json.dumps(summary, sort_keys=True), flush=True)
+                if not expected_result:
+                    raise ValueError(f"measured replay aborted with {summary['status']}")
+                return summary, verified_fusion
             if fusion_trial:
-                return verify_fusion(config, fusion_report, fused, reference, count,
-                                     fusion_trial == "fusion-delay")
+                return verified_fusion
             return
-        elif config and reply.startswith(b"PLACEMENT "):
+        elif (config or timing is not None) and reply.startswith(b"PLACEMENT "):
             if sent != count or placement is not None:
                 raise ValueError(f"unexpected placement report: {reply!r}")
             placement = tuple(map(int, reply.split()[1:]))
-        elif config and reply.startswith(b"CANDIDATE "):
+        elif (config or timing is not None) and reply.startswith(b"CANDIDATE "):
             lead, location, frame = map(int, reply.split()[1:])
             if (placement is None or fusion_report is not None or not 0 <= lead < len(LEADS)
                     or not 0 <= location <= frame < count):
                 raise ValueError(f"invalid board candidate: {reply!r}")
             candidates[lead].append((location, frame))
-        elif fusion_trial and reply.startswith(b"FUSION "):
+        elif (fusion_trial or timing is not None) and reply.startswith(b"FUSION "):
             fields = reply.split()[1:]
             if placement is None or fusion_report is not None or len(fields) != 4:
                 raise ValueError(f"unexpected fusion report: {reply!r}")
             fusion_report = tuple(map(int, fields))
             if min(fusion_report) < 0:
                 raise ValueError(f"negative fusion parameter or count: {reply!r}")
-        elif fusion_trial and reply.startswith(b"FUSED "):
+        elif (fusion_trial or timing is not None) and reply.startswith(b"FUSED "):
             fields = reply.split()[1:]
             if fusion_report is None or len(fields) != 1:
                 raise ValueError(f"unexpected fused beat: {reply!r}")
             fused.append(int(fields[0]))
+        elif timing is not None and reply and reply.split(maxsplit=1)[0] in (b"TIMING", b"CPU", b"FRAME", b"BEAT"):
+            timing.accept(reply)
         elif reply != b"READY 1":
             raise ValueError(f"unexpected UART reply: {reply!r}")
     raise TimeoutError("ESP32-S3 stopped responding on UART")
@@ -305,7 +348,18 @@ def main():
                         help="compare board fusion with the offline candidates")
     parser.add_argument("--delay-fusion-handoffs", action="store_true",
                         help="repeat fusion verification with delayed handoffs from worker 2")
+    parser.add_argument("--score-window", type=int, nargs=2, metavar=("START", "END"),
+                        help="measure the half-open window in replay-local sample indices")
+    parser.add_argument("--compare-timing", action="store_true",
+                        help="repeat the same normal measured run with detailed timing disabled")
+    parser.add_argument("--raw-report", type=Path,
+                        help="save board records from all trials for independent inspection")
     args = parser.parse_args()
+    if args.compare_timing and (not args.score_window or args.mode != "normal"
+                                or args.delay_fusion_handoffs):
+        parser.error("--compare-timing requires only a normal measured trial")
+    if args.raw_report and not args.score_window:
+        parser.error("--raw-report requires --score-window")
     if bool(args.configuration) != bool(args.scalar_replay):
         parser.error("--configuration and --scalar-replay must be supplied together")
     if args.configuration and args.mode not in ("normal", "all"):
@@ -317,22 +371,42 @@ def main():
 
     try:
         payload, payload_path = load_payload(args.manifest)
+        if args.score_window:
+            start, end = args.score_window
+            if not 0 <= start < end <= len(payload) // FRAME_BYTES:
+                raise ValueError("score window must be inside the replay")
         reference = offline_candidates(args.scalar_replay, payload_path) if args.scalar_replay else None
-        port = os.open(args.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        try:
+        with ExitStack() as stack:
+            raw_reports = stack.enter_context(args.raw_report.open("x")) if args.raw_report else None
+            port = os.open(args.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            stack.callback(os.close, port)
             configure_port(port)
             wait_for_board(port)
             replies = board_lines(port)
             for mode in MODES if args.mode == "all" else (args.mode,):
                 config = args.configuration if mode == "normal" else None
                 fusion_trial = "fusion" if config and args.verify_fusion else None
-                normal = run_trial(port, replies, mode, payload, config, reference, fusion_trial)
+                timing = TimingReport(start, end, detailed=True) if args.score_window else None
+                normal = run_trial(port, replies, mode, payload, config, reference, fusion_trial,
+                                   timing, raw_reports=raw_reports)
+                if args.compare_timing:
+                    baseline = run_trial(port, replies, mode, payload, config, reference, fusion_trial,
+                                         TimingReport(start, end, detailed=False), raw_reports=raw_reports)
+                    if normal[1] != baseline[1]:
+                        raise ValueError("fusion changed with detailed timing disabled")
+                    on = normal[0]["pipeline_cpu_us"]
+                    off = baseline[0]["pipeline_cpu_us"]
+                    print(json.dumps({"detailed_timing_cpu_overhead_us": on - off,
+                                      "detailed_timing_cpu_overhead_fraction":
+                                          (on - off) / off if off else None}))
                 if config and args.delay_fusion_handoffs:
-                    delayed = run_trial(port, replies, mode, payload, config, reference, "fusion-delay")
+                    delayed_timing = TimingReport(start, end, detailed=True) if timing else None
+                    delayed = run_trial(port, replies, mode, payload, config, reference, "fusion-delay",
+                                        delayed_timing, delayed=True, raw_reports=raw_reports)
+                    if timing:
+                        normal, delayed = normal[1], delayed[1]
                     if normal != delayed:
                         raise ValueError("fusion parameters or output changed after delaying handoffs")
-        finally:
-            os.close(port)
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         print(f"UART replay failed: {error}", file=sys.stderr)
         return 1

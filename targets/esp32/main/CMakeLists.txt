@@ -3,7 +3,7 @@ if(NOT SECOND_WORKER_CORE MATCHES "^[01]$")
     message(FATAL_ERROR "SECOND_WORKER_CORE must be 1 (A) or 0 (B)")
 endif()
 
-idf_component_register(SRCS replay_uart.c replay_ring.c ../../../src/pan_tompkins.c
+idf_component_register(SRCS replay_uart.c replay_ring.c replay_cpu.c ../../../src/pan_tompkins.c
                             ../../../src/beat_fusion.c
                        INCLUDE_DIRS .
                        PRIV_INCLUDE_DIRS ../../../src

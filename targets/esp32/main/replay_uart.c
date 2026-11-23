@@ -1,4 +1,5 @@
 #include "replay_ring.h"
+#include "replay_cpu.h"
 #include "beat_fusion.h"
 
 #include <errno.h>
@@ -47,6 +48,50 @@ typedef enum {
 } ReportMode;
 
 typedef struct {
+    uint32_t start;
+    uint32_t end;
+    bool detailed;
+} ScoreWindow;
+
+typedef struct {
+    uint32_t released_us;
+    uint32_t completed_us[WORKER_COUNT];
+} FrameTiming;
+
+typedef struct {
+    uint32_t location;
+    uint32_t reported_us;
+} BeatTiming;
+
+typedef struct {
+    int64_t epoch_us;
+    const ScoreWindow *window;
+    FrameTiming *frames;
+    uint64_t cpu[REPLAY_CPU_TASKS];
+    bool cpu_complete;
+    uint32_t stopped_us;
+} TrialTiming;
+
+static int64_t schedule_offset(uint32_t index)
+{
+    return (int64_t)index * 1000000 / REPLAY_RATE_HZ;
+}
+
+static uint32_t timestamp(const TrialTiming *timing)
+{
+    // Zero denotes a missing event.
+    return (uint32_t)(esp_timer_get_time() - timing->epoch_us) + 1;
+}
+
+static FrameTiming *frame_timing(TrialTiming *timing, uint32_t index)
+{
+    if (timing->frames == NULL || index >= timing->window->end) {
+        return NULL;
+    }
+    return &timing->frames[index];
+}
+
+typedef struct {
     PtDetector detector;
     PtCandidate *candidates;
     _Atomic size_t candidate_count;
@@ -63,6 +108,7 @@ typedef struct {
     int core;
     TaskHandle_t task;
     TaskHandle_t fusion_task;
+    TrialTiming *timing;
     uint32_t frames;
     uint32_t index_errors;
     uint32_t crc;
@@ -72,6 +118,9 @@ typedef struct {
     BeatFusion fusion;
     uint32_t *locations;
     size_t count;
+    TrialTiming *timing;
+    BeatTiming *beats;
+    size_t scored_beats;
 } FusionTrial;
 
 static ReplayRing ring;
@@ -116,6 +165,10 @@ static void replay_worker(void *argument)
                 ++worker->delayed_handoffs;
                 vTaskDelay(pdMS_TO_TICKS(TEST_HANDOFF_DELAY_MS));
             }
+            FrameTiming *measured = frame_timing(worker->timing, frame->index);
+            if (measured != NULL) {
+                measured->completed_us[worker->id] = timestamp(worker->timing);
+            }
             ++worker->frames;
             replay_ring_finish(&ring, worker->id);
             xTaskNotify(worker->fusion_task, FUSION_PROGRESS, eSetBits);
@@ -128,6 +181,10 @@ static void replay_worker(void *argument)
 static void retain_fused_beat(void *context, uint32_t location)
 {
     FusionTrial *trial = context;
+    if (trial->beats != NULL && location >= trial->timing->window->start
+        && location < trial->timing->window->end) {
+        trial->beats[trial->scored_beats++] = (BeatTiming){location, timestamp(trial->timing)};
+    }
     trial->locations[trial->count++] = location;
 }
 
@@ -230,7 +287,37 @@ static void write_fusion(const FusionTrial *trial)
     }
 }
 
-static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, ReportMode report)
+static void write_timing(const TrialTiming *timing, const FusionTrial *fusion, uint32_t published)
+{
+    char line[128];
+    snprintf(line, sizeof(line), "TIMING %" PRIu32 " %" PRIu32 " %u %" PRIu32
+             " %u\n", timing->window->start, timing->window->end,
+             (unsigned)timing->window->detailed, timing->stopped_us, (unsigned)timing->cpu_complete);
+    write_line(line);
+    if (timing->cpu_complete) {
+        snprintf(line, sizeof(line), "CPU %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+                 timing->cpu[0], timing->cpu[1], timing->cpu[2], timing->cpu[3]);
+        write_line(line);
+    }
+    if (!timing->window->detailed) {
+        return;
+    }
+    uint32_t end = published < timing->window->end ? published : timing->window->end;
+    for (uint32_t index = 0; index < end; ++index) {
+        const FrameTiming *frame = &timing->frames[index];
+        snprintf(line, sizeof(line), "FRAME %" PRIu32 " %" PRIu32 " %" PRIu32 " %" PRIu32 "\n",
+                 index, frame->released_us, frame->completed_us[0], frame->completed_us[1]);
+        write_line(line);
+    }
+    for (size_t index = 0; index < fusion->scored_beats; ++index) {
+        snprintf(line, sizeof(line), "BEAT %" PRIu32 " %" PRIu32 "\n",
+                 fusion->beats[index].location, fusion->beats[index].reported_us);
+        write_line(line);
+    }
+}
+
+static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, ReportMode report,
+                      const ScoreWindow *window)
 {
     uint32_t max_frames = count;
     if (mode == INJECT_UNDERRUN) {
@@ -241,12 +328,22 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
     // Accepted locations are inside the replay and separated by at least the refractory interval.
     size_t capacity = 1 + (max_frames - 1) / PT_REFRACTORY_SAMPLES;
     PtCandidate *candidates = calloc(FRAME_LEADS * capacity, sizeof(*candidates));
+    TrialTiming timing = {.window = window};
+    if (window != NULL && window->detailed) {
+        timing.frames = calloc(window->end, sizeof(*timing.frames));
+    }
     FusionTrial fusion = {
+        .timing = &timing,
+        .beats = timing.frames != NULL
+            ? calloc(FRAME_LEADS * capacity / 2, sizeof(*fusion.beats)) : NULL,
         .fusion = {.window = FUSION_WINDOW, .max_delay = FUSION_MAX_DELAY},
         // A fused beat consumes at least two distinct candidates.
         .locations = calloc(FRAME_LEADS * capacity / 2, sizeof(*fusion.locations)),
     };
-    if (candidates == NULL || fusion.locations == NULL) {
+    if (candidates == NULL || fusion.locations == NULL
+        || (window != NULL && window->detailed && (timing.frames == NULL || fusion.beats == NULL))) {
+        free(timing.frames);
+        free(fusion.beats);
         free(candidates);
         free(fusion.locations);
         write_line("ERROR CANDIDATE_STORAGE\n");
@@ -258,6 +355,7 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
     memset(workers, 0, sizeof(workers));
     for (unsigned id = 0; id < WORKER_COUNT; ++id) {
         workers[id].id = id;
+        workers[id].timing = &timing;
         workers[id].stalled = mode == INJECT_OVERFLOW && id == 1;
         workers[id].delay_handoffs = mode == INJECT_HANDOFF_DELAY && id == 1;
         workers[id].candidate_capacity = capacity;
@@ -300,14 +398,36 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
     if (wait_for_prefill(granted)) {
         result = "OK";
         int64_t start_us = esp_timer_get_time();
+        int64_t score_end_us = start_us;
+        uint64_t cpu_start[REPLAY_CPU_TASKS] = {0};
+        if (window != NULL) {
+            start_us += 2000;
+            score_end_us = start_us + schedule_offset(window->end);
+            TaskHandle_t tasks[] = {
+                xTaskGetCurrentTaskHandle(), workers[0].task, workers[1].task, fusion_task,
+            };
+            replay_cpu_begin(tasks, start_us + schedule_offset(window->start), score_end_us);
+        }
+        timing.epoch_us = start_us;
         int64_t first_release_us = start_us;
         for (; published < count; ++published) {
-            scheduled_span_us = (int64_t)published * 1000000 / REPLAY_RATE_HZ;
+            scheduled_span_us = schedule_offset(published);
             int64_t scheduled_us = start_us + scheduled_span_us;
             wait_for_release(timer, scheduled_us);
 
+            if (window != NULL && published == window->start) {
+                replay_cpu_snapshot(scheduled_us, cpu_start);
+            }
+            if (window != NULL && published == window->end) {
+                replay_cpu_snapshot(score_end_us, timing.cpu);
+                timing.cpu_complete = true;
+            }
             uint8_t bytes[FRAME_BYTES];
             bool has_frame = uart_read_bytes(REPLAY_UART, bytes, sizeof(bytes), 0) == FRAME_BYTES;
+            FrameTiming *measured = frame_timing(&timing, published);
+            if (has_frame && measured != NULL) {
+                measured->released_us = timestamp(&timing);
+            }
             bool delivered = has_frame && replay_ring_publish(&ring, bytes);
             int64_t actual_us = esp_timer_get_time();
             if (published == 0) {
@@ -335,6 +455,22 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
                 grant_frames(next);
                 granted += next;
             }
+        }
+        if (window != NULL) {
+            if (published == count && window->end == count) {
+                wait_for_release(timer, score_end_us);
+            }
+            timing.stopped_us = timestamp(&timing);
+            if (!timing.cpu_complete && start_us + timing.stopped_us - 1 >= score_end_us) {
+                replay_cpu_snapshot(score_end_us, timing.cpu);
+                timing.cpu_complete = true;
+            }
+            if (timing.cpu_complete) {
+                for (unsigned id = 0; id < REPLAY_CPU_TASKS; ++id) {
+                    timing.cpu[id] -= cpu_start[id];
+                }
+            }
+            replay_cpu_end();
         }
     }
     atomic_store_explicit(&stop_workers, true, memory_order_release);
@@ -369,15 +505,57 @@ static void run_trial(esp_timer_handle_t timer, uint32_t count, TrialMode mode, 
             write_fusion(&fusion);
         }
     }
+    if (window != NULL) {
+        write_timing(&timing, &fusion, published);
+    }
+    free(fusion.beats);
+    free(timing.frames);
     free(fusion.locations);
     free(candidates);
     write_line(summary);
+}
+
+static void handle_measurement(esp_timer_handle_t timer, const char *command)
+{
+    uint32_t count;
+    ScoreWindow window;
+    char detail[4];
+    char mode[10];
+    char extra;
+    if (sscanf(command, "%" SCNu32 " %" SCNu32 " %" SCNu32 " %3s %9s %c",
+               &count, &window.start, &window.end, detail, mode, &extra) != 5
+        || window.start >= window.end || window.end > count
+        || schedule_offset(count) >= UINT32_MAX / 2
+        || (strcmp(detail, "on") != 0 && strcmp(detail, "off") != 0)) {
+        write_line("ERROR SCORE_WINDOW\n");
+        return;
+    }
+    window.detailed = strcmp(detail, "on") == 0;
+    TrialMode trial;
+    if (strcmp(mode, "normal") == 0) {
+        trial = NORMAL;
+    } else if (strcmp(mode, "delay") == 0) {
+        trial = INJECT_HANDOFF_DELAY;
+    } else if (count >= 2 && strcmp(mode, "underrun") == 0) {
+        trial = INJECT_UNDERRUN;
+    } else if (count > RING_CAPACITY && strcmp(mode, "overflow") == 0) {
+        trial = INJECT_OVERFLOW;
+    } else {
+        write_line("ERROR SCORE_MODE\n");
+        return;
+    }
+    run_trial(timer, count, trial, REPORT_FUSION, &window);
 }
 
 static void handle_command(esp_timer_handle_t timer, const char *command)
 {
     if (strcmp(command, "PING") == 0) {
         write_line("READY 1\n");
+        return;
+    }
+
+    if (strncmp(command, "MEASURE ", 8) == 0) {
+        handle_measurement(timer, command + 8);
         return;
     }
 
@@ -392,17 +570,17 @@ static void handle_command(esp_timer_handle_t timer, const char *command)
         return;
     }
     if (strcmp(end, " normal") == 0) {
-        run_trial(timer, count, NORMAL, REPORT_RESULT);
+        run_trial(timer, count, NORMAL, REPORT_RESULT, NULL);
     } else if (strcmp(end, " parity") == 0) {
-        run_trial(timer, count, NORMAL, REPORT_CANDIDATES);
+        run_trial(timer, count, NORMAL, REPORT_CANDIDATES, NULL);
     } else if (strcmp(end, " fusion") == 0) {
-        run_trial(timer, count, NORMAL, REPORT_FUSION);
+        run_trial(timer, count, NORMAL, REPORT_FUSION, NULL);
     } else if (strcmp(end, " fusion-delay") == 0) {
-        run_trial(timer, count, INJECT_HANDOFF_DELAY, REPORT_FUSION);
+        run_trial(timer, count, INJECT_HANDOFF_DELAY, REPORT_FUSION, NULL);
     } else if (count >= 2 && strcmp(end, " underrun") == 0) {
-        run_trial(timer, count, INJECT_UNDERRUN, REPORT_RESULT);
+        run_trial(timer, count, INJECT_UNDERRUN, REPORT_RESULT, NULL);
     } else if (count > RING_CAPACITY && strcmp(end, " overflow") == 0) {
-        run_trial(timer, count, INJECT_OVERFLOW, REPORT_RESULT);
+        run_trial(timer, count, INJECT_OVERFLOW, REPORT_RESULT, NULL);
     }
 }
 
@@ -432,7 +610,7 @@ void app_main(void)
     esp_timer_handle_t timer;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer));
 
-    char command[48];
+    char command[64];
     size_t length = 0;
     for (;;) {
         uint8_t byte;

@@ -133,3 +133,63 @@ On 2026-11-23, both ESP-IDF 5.5.1 builds passed on the same ESP32-S3 revision v0
 All four runs matched the offline fused sequence exactly. Its SHA-256 was `0eefd555f2c2e1946ef02c2359ff2e7096f4bf7e491f1de36028a3fb93cdc6ea`. Both builds also passed the deliberate input-underrun and ring-overflow trials. The prior flash contents were restored and verified byte-for-byte by readback.
 
 The app image SHA-256 was `4a09a451cfdc890b7eefa5a59efc12badf60cb61f004ed0897deb4d7b4bd51ab` for A and `8aa0907a36400de1a9443c83f9070f3e2ba40abdaeee070d2cf18688532360e8` for B. Both builds exported compilation databases. This pass changed C and Python, so the C++ clang-tidy workflow did not apply.
+
+## Scored timing and CPU measurements
+
+Use the same firmware build options and placement assignments as the scalar parity run. Generate replay bytes with real pre-roll and at least `W + H` real post-roll frames. Score by replay-local index. This I01 pilot uses 257 pre-roll frames, 7,710 scored frames, and 257 post-roll frames.
+
+```bash
+run_dir=$(mktemp -d)
+python3 tools/incart_replay.py --offline --stop 8224 --output-dir "$run_dir"
+python3 tools/incart_replay.py --offline --stop 1028 --output-dir "$run_dir"
+cc -std=c11 -O2 -Isrc src/pan_tompkins.c tools/scalar_replay.c -o "$run_dir/scalar_replay"
+python3 tests/replay_timing_test.py
+
+# With the board reserved and its current flash backed up, run once per flashed placement.
+config=A
+common=(python3 tools/uart_replay.py /dev/ttyUSB0 --configuration "$config"
+    --scalar-replay "$run_dir/scalar_replay" --verify-fusion)
+"${common[@]}" --manifest "$run_dir/I01_0_8224_scale1024.json" --score-window 257 7967 \
+    --raw-report "$run_dir/full-$config.raw"
+"${common[@]}" --manifest "$run_dir/I01_0_1028_scale1024.json" --score-window 64 675 \
+    --delay-fusion-handoffs --raw-report "$run_dir/delay-$config.raw"
+"${common[@]}" --manifest "$run_dir/I01_0_1028_scale1024.json" --score-window 64 799 \
+    --compare-timing --raw-report "$run_dir/overhead-$config.raw"
+for mode in underrun overflow; do
+    python3 tools/uart_replay.py /dev/ttyUSB0 --manifest "$run_dir/I01_0_1028_scale1024.json" \
+        --mode "$mode" --score-window 0 64 --raw-report "$run_dir/$mode-$config.raw"
+done
+```
+
+The board records three 32-bit timestamps per retained frame in RAM. It timestamps publication immediately before the ring write, worker completion after detector updates and candidate handoff and just before advancing the cursor, and beat reporting at the fusion callback. Stamps are microseconds since the replay epoch plus one. Zero identifies a missing event. The board retains pre-roll frame records to measure any work outstanding at the start. It captures full completion times for scored frames even if they finish later, and captures beats by their estimated location even if fusion emits them after the window. Detailed records leave the board after replay and drain. At `[257,7967)`, frame timing records occupy 95,604 bytes plus 8 bytes per allocated beat slot.
+
+The host derives full-frame latency from the later worker stamp minus scheduled release, and worker latency from each worker stamp minus scheduled release. The p95 uses nearest rank. A completion at the next scheduled release is a deadline miss. An unfinished frame whose deadline has elapsed at abort also counts as a miss, and a deadline still in the future is reported as unresolved. The host reconstructs backlog from publications and joint completions, grouping events at microsecond resolution. End backlog includes completions at the scheduled end and excludes new publications at that boundary. If a failed run stops before the boundary, end backlog and full-window CPU are unavailable. Underrun and overflow remain distinct trial outcomes.
+
+Scheduler switch hooks accumulate actual scheduled execution for the replay task, both workers, and fusion. At each scheduled boundary the counters include the applicable portion of an in-flight task slice. Intervals are clipped to the window so a late timer wakeup cannot add work beyond it. CPU is reported in seconds per second of ECG using `(end - start) / 257` as the denominator. It uses scheduler task accounting, so interrupt work during a task's scheduled slice can be attributed to that slice. The matched detailed-on/off check keeps the CPU hooks, pacing, workload, and parity checks enabled in both runs. Its difference estimates the incremental cost of detailed frame and beat capture.
+
+### I01 scored-window hardware results
+
+ESP-IDF 5.5.1 builds A and B ran on the same physical ESP32-S3 with byte-identical SDK configurations. Both workers processed all 8,224 canonical frames in order. The triplet CRCs were `0f15ee60` and `83b1a809`, and the replay payload SHA-256 was `0d0b8420782fcfbf59fbac91130a241d72411f22b7db2ba764402500d94b906e`. Both builds matched all 298 offline candidates and emitted the same 70 fused beats. The window included 68 of those beats by location, including two reported after the scheduled end in each build.
+
+| Metric | A | B |
+| --- | ---: | ---: |
+| Scored frames | 7,710 | 7,710 |
+| Frame latency p95 (µs) | 250 | 170 |
+| Worker 1 completion latency p95 (µs) | 246 | 166 |
+| Worker 2 completion latency p95 (µs) | 244 | 168 |
+| Beat reporting latency p95 (µs) | 548,925 | 548,842 |
+| Input/replay CPU (ms per ECG second) | 12.849 | 14.831 |
+| Worker 1 CPU (ms per ECG second) | 21.725 | 23.971 |
+| Worker 2 CPU (ms per ECG second) | 21.610 | 23.907 |
+| Fusion CPU (ms per ECG second) | 12.991 | 5.038 |
+| Pipeline CPU (ms per ECG second) | 69.174 | 67.748 |
+| Deadline misses / peak backlog / end backlog | 0 / 1 / 0 | 0 / 1 / 0 |
+| Input underruns / ring overflows | 0 / 0 | 0 / 0 |
+
+The injected-delay runs recorded 28 deadline misses in A and 27 in B. Peak backlog was 5 and end backlog was 1 in both. One scored frame finished after the window and one scored beat was reported after the window in each run. Both workers still processed all 1,028 frames exactly once. The last scheduled offset was 3,996,108 µs and maximum publication lateness was 93 µs in A and 406 µs in B. Both builds distinguished an input underrun after one published frame from overflow at 64 published frames. The overflow run retained 64 deadline misses, a peak backlog of 64, and an end backlog of 64.
+
+The matched 735-frame window measured an incremental detailed capture cost of 2,499 µs in A (1.28% of baseline pipeline CPU) and 2,802 µs in B (1.48%). Each estimate uses one on/off pair with exact candidate and fusion parity.
+
+Host timing tests, the fusion and ring regression tests, and an independent recomputation from the board records passed. The prior flash contents were restored and verified byte-for-byte by readback. Local board records and the independent checker are in `data/timing/issue6/`.
+
+The app image SHA-256 was `43216eb31453ccc462e8bd8bd08a3746e0eb3290f64e3fd9e78b44fb59f2684e` for A and `ec3f299e2eb4a6d72d0aa18a3b95ee37598bd4da584595c2196126376afd54a4` for B. Both builds exported compilation databases. The implementation changed C and Python, so the C++ clang-tidy workflow did not apply.
