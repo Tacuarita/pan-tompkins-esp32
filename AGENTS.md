@@ -1,5 +1,7 @@
 # C++ implementation and review
 
+Use C++20 or earlier for host and ESP32-S3 code. Configure C++ builds and clang-tidy to use the same language standard. Keep source and standard-library usage within the configured standard.
+
 After each C++ implementation pass, run clang-tidy before handing off the work or marking the ticket complete.
 
 1. Configure the affected host and ESP32-S3 builds to export `compile_commands.json`. Analyze the changed C++ translation units and those that include changed project headers, using the compilation database for each affected configuration. Use `--header-filter` to include the project's headers when the configuration does not already cover them.
