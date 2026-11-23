@@ -66,8 +66,18 @@ uint16_t pt_square(int16_t derivative)
     return (uint16_t)((value * value) >> PT_SQUARE_SHIFT);
 }
 
-static void integrate(PtDetector *detector, uint32_t frame, int16_t filtered)
+void pt_square_triplet_scalar(const int16_t derivatives[PT_TRIPLET_LEADS],
+                              uint16_t energies[PT_TRIPLET_LEADS])
 {
+    for (unsigned lead = 0; lead < PT_TRIPLET_LEADS; ++lead) {
+        energies[lead] = pt_square(derivatives[lead]);
+    }
+}
+
+static int16_t prepare_feature(PtDetector *detector, int16_t sample)
+{
+    uint32_t frame = detector->next_frame++;
+    int16_t filtered = filter(detector, frame, sample);
     unsigned slot = frame % BAND_SLOTS;
     detector->band[slot] = filtered;
     int32_t derivative = 2 * (int32_t)filtered
@@ -77,17 +87,11 @@ static void integrate(PtDetector *detector, uint32_t frame, int16_t filtered)
     int16_t clipped = clamp(round_divide(derivative, 2),
                             -PT_DERIVATIVE_LIMIT, PT_DERIVATIVE_LIMIT);
 
-    unsigned feature_slot = frame % FEATURE_SLOTS;
-    PtFeature *expired = &detector->features[(feature_slot + 1) % FEATURE_SLOTS];
-    PtFeature *feature = &detector->features[feature_slot];
-    detector->energy_sum -= expired->energy;
-    *feature = (PtFeature){
-        .magnitude = magnitude(detector->band[(slot + BAND_SLOTS - PT_DERIVATIVE_DELAY)
-                                              % BAND_SLOTS]),
-        .slope = magnitude(clipped),
-        .energy = pt_square(clipped)
-    };
-    detector->energy_sum += feature->energy;
+    PtFeature *feature = &detector->features[frame % FEATURE_SLOTS];
+    feature->magnitude = magnitude(detector->band[(slot + BAND_SLOTS - PT_DERIVATIVE_DELAY)
+                                                  % BAND_SLOTS]);
+    feature->slope = magnitude(clipped);
+    return clipped;
 }
 
 static PtPeak locate_peak(const PtDetector *detector, uint32_t frame, uint16_t integrated)
@@ -152,12 +156,14 @@ static void accept(PtDetector *detector, PtPeak peak, uint32_t frame,
     *candidate = (PtCandidate){peak.location, frame};
 }
 
-bool pt_process(PtDetector *detector, int16_t sample, PtCandidate *candidate)
+static bool finish_feature(PtDetector *detector, uint16_t energy, PtCandidate *candidate)
 {
-    uint32_t frame = detector->next_frame++;
-    int16_t filtered = filter(detector, frame, sample);
+    uint32_t frame = detector->next_frame - 1;
     uint32_t previous_sum = detector->energy_sum;
-    integrate(detector, frame, filtered);
+    unsigned slot = frame % FEATURE_SLOTS;
+    detector->energy_sum -= detector->features[(slot + 1) % FEATURE_SLOTS].energy;
+    detector->features[slot].energy = energy;
+    detector->energy_sum += energy;
     bool local_maximum = previous_sum >= detector->previous_energy_sum
                       && previous_sum > detector->energy_sum;
     detector->previous_energy_sum = previous_sum;
@@ -196,4 +202,29 @@ bool pt_process(PtDetector *detector, int16_t sample, PtCandidate *candidate)
         }
     }
     return false;
+}
+
+bool pt_process(PtDetector *detector, int16_t sample, PtCandidate *candidate)
+{
+    int16_t derivative = prepare_feature(detector, sample);
+    return finish_feature(detector, pt_square(derivative), candidate);
+}
+
+unsigned pt_process_triplet(PtDetector *const detectors[PT_TRIPLET_LEADS],
+                            const int16_t samples[PT_TRIPLET_LEADS],
+                            PtCandidate candidates[PT_TRIPLET_LEADS], PtSquareTriplet *square)
+{
+    int16_t derivatives[PT_TRIPLET_LEADS];
+    uint16_t energies[PT_TRIPLET_LEADS];
+    for (unsigned lead = 0; lead < PT_TRIPLET_LEADS; ++lead) {
+        derivatives[lead] = prepare_feature(detectors[lead], samples[lead]);
+    }
+    square(derivatives, energies);
+    unsigned produced = 0;
+    for (unsigned lead = 0; lead < PT_TRIPLET_LEADS; ++lead) {
+        if (finish_feature(detectors[lead], energies[lead], &candidates[lead])) {
+            produced |= 1u << lead;
+        }
+    }
+    return produced;
 }

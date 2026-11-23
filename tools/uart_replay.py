@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 from select import select
+from statistics import median
 import subprocess
 import sys
 import termios
@@ -22,7 +23,8 @@ FRAME_BYTES = 12
 TRIPLET_BYTES = FRAME_BYTES // 2
 MODES = ("normal", "underrun", "overflow")
 LEADS = ("I", "II", "III", "aVR", "aVL", "aVF")
-PLACEMENTS = {"A": (0, 1, 1), "B": (0, 1, 0)}
+PLACEMENTS = {"A": (0, 1, 1), "B": (0, 1, 0), "C": (0, 1, 1), "D": (0, 1, 0)}
+READY = (b"READY 1", b"READY 2")
 DEFAULT_MANIFEST = Path("data/replay/I01_0_7710_scale1024.json")
 
 
@@ -169,8 +171,8 @@ def wait_for_board(port):
     while time.monotonic() < deadline:
         write_all(port, b"\nPING\n")
         for line in board_lines(port, timeout=0.25):
-            if line == b"READY 1":
-                return
+            if line in READY:
+                return int(line[-1:])
     raise TimeoutError("ESP32-S3 did not acknowledge the UART handshake")
 
 
@@ -189,6 +191,39 @@ def board_lines(port, timeout=8):
             yield line.strip()
         if len(pending) > 4096:
             raise ValueError("oversized UART response")
+
+
+def verify_squaring_mode(port, replies, configuration):
+    expected = b"scalar" if configuration in ("A", "B") else b"simd"
+    write_all(port, b"SQUARE MODE\n")
+    actual = next((line for line in replies if line not in READY), b"")
+    if actual != b"SQUARE MODE " + expected:
+        raise ValueError(f"configuration {configuration} expected {expected!r}, received {actual!r}")
+
+
+def run_squaring_benchmark(port, replies):
+    write_all(port, b"SQUARE BENCH\n")
+    runs = []
+    for reply in replies:
+        if reply == b"SQUARE OK" and len(runs) == 7:
+            print(json.dumps({
+                "squaring_runs": runs,
+                "median_scalar_cycles_per_triplet": median(
+                    run["scalar_cycles"] / run["triplets"] for run in runs
+                ),
+                "median_simd_cycles_per_triplet": median(
+                    run["simd_cycles"] / run["triplets"] for run in runs
+                ),
+            }))
+            return
+        fields = reply.split()
+        if len(fields) != 6 or fields[:2] != [b"SQUARE", b"RUN"]:
+            raise ValueError(f"squaring benchmark failed: {reply!r}")
+        run, triplets, scalar, simd = map(int, fields[2:])
+        if run != len(runs) + 1 or run > 7 or triplets != 5793 or min(scalar, simd) <= 0:
+            raise ValueError(f"invalid squaring benchmark record: {reply!r}")
+        runs.append({"triplets": triplets, "scalar_cycles": scalar, "simd_cycles": simd})
+    raise TimeoutError("ESP32-S3 did not finish the squaring benchmark")
 
 
 def triplet_crc(payload, worker, frames):
@@ -332,7 +367,7 @@ def run_trial(port, replies, mode, payload, config=None, reference=None, fusion_
             fused.append(int(fields[0]))
         elif timing is not None and reply and reply.split(maxsplit=1)[0] in (b"TIMING", b"CPU", b"FRAME", b"BEAT"):
             timing.accept(reply)
-        elif reply != b"READY 1":
+        elif reply not in READY:
             raise ValueError(f"unexpected UART reply: {reply!r}")
     raise TimeoutError("ESP32-S3 stopped responding on UART")
 
@@ -342,7 +377,9 @@ def main():
     parser.add_argument("port", help="USB UART TTY, such as /dev/ttyUSB0")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--mode", choices=(*MODES, "all"), default="normal")
-    parser.add_argument("--configuration", choices=PLACEMENTS, help="verify the board's scalar placement")
+    parser.add_argument("--configuration", choices=PLACEMENTS, help="verify board placement and squaring mode")
+    parser.add_argument("--benchmark-squaring", action="store_true",
+                        help="check and time both three-lead squaring kernels on the board before replay")
     parser.add_argument("--scalar-replay", type=Path, help="host scalar replay executable for exact parity")
     parser.add_argument("--verify-fusion", action="store_true",
                         help="compare board fusion with the offline candidates")
@@ -381,8 +418,14 @@ def main():
             port = os.open(args.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
             stack.callback(os.close, port)
             configure_port(port)
-            wait_for_board(port)
+            protocol = wait_for_board(port)
             replies = board_lines(port)
+            if protocol == 1 and (args.benchmark_squaring or args.configuration in ("C", "D")):
+                raise ValueError("this firmware predates SIMD squaring")
+            if protocol >= 2 and args.configuration:
+                verify_squaring_mode(port, replies, args.configuration)
+            if args.benchmark_squaring:
+                run_squaring_benchmark(port, replies)
             for mode in MODES if args.mode == "all" else (args.mode,):
                 config = args.configuration if mode == "normal" else None
                 fusion_trial = "fusion" if config and args.verify_fusion else None

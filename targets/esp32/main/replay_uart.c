@@ -1,6 +1,7 @@
 #include "replay_ring.h"
 #include "replay_cpu.h"
 #include "beat_fusion.h"
+#include "square_triplet.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -33,6 +34,15 @@ enum {
 };
 
 _Static_assert((int)FUSION_LEADS == (int)FRAME_LEADS, "Fusion must read every lead");
+_Static_assert((int)PT_TRIPLET_LEADS == (int)LEADS_PER_WORKER, "Each worker owns a triplet");
+
+#if USE_SIMD_SQUARING
+#define WORKER_SQUARE pt_square_triplet_simd
+#define SQUARE_MODE "simd"
+#else
+#define WORKER_SQUARE pt_square_triplet_scalar
+#define SQUARE_MODE "scalar"
+#endif
 
 typedef enum {
     NORMAL,
@@ -132,6 +142,10 @@ static void replay_worker(void *argument)
 {
     Worker *worker = argument;
     worker->core = xPortGetCoreID();
+    PtDetector *detectors[LEADS_PER_WORKER];
+    for (unsigned lane = 0; lane < LEADS_PER_WORKER; ++lane) {
+        detectors[lane] = &worker->leads[lane].detector;
+    }
     bool stopping;
     do {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -140,22 +154,21 @@ static void replay_worker(void *argument)
         while (!worker->stalled && (frame = replay_ring_peek(&ring, worker->id)) != NULL) {
             worker->index_errors += frame->index != worker->frames;
             uint8_t triplet[2 * LEADS_PER_WORKER];
-            bool produced = false;
+            PtCandidate candidates[LEADS_PER_WORKER];
+            const int16_t *samples = &frame->samples[worker->id * LEADS_PER_WORKER];
+            unsigned produced = pt_process_triplet(detectors, samples, candidates, WORKER_SQUARE);
             for (unsigned lane = 0; lane < LEADS_PER_WORKER; ++lane) {
-                int16_t sample = frame->samples[worker->id * LEADS_PER_WORKER + lane];
-                uint16_t code = (uint16_t)sample;
+                uint16_t code = (uint16_t)samples[lane];
                 triplet[2 * lane] = code & 0xff;
                 triplet[2 * lane + 1] = code >> 8;
 
                 Lead *lead = &worker->leads[lane];
-                PtCandidate candidate;
-                if (pt_process(&lead->detector, sample, &candidate)) {
-                    produced = true;
+                if (produced & (1u << lane)) {
                     size_t count = atomic_load_explicit(&lead->candidate_count, memory_order_relaxed);
                     if (count == worker->candidate_capacity) {
                         worker->candidate_overflow = true;
                     } else {
-                        lead->candidates[count] = candidate;
+                        lead->candidates[count] = candidates[lane];
                         atomic_store_explicit(&lead->candidate_count, count + 1, memory_order_release);
                     }
                 }
@@ -550,7 +563,26 @@ static void handle_measurement(esp_timer_handle_t timer, const char *command)
 static void handle_command(esp_timer_handle_t timer, const char *command)
 {
     if (strcmp(command, "PING") == 0) {
-        write_line("READY 1\n");
+        write_line("READY 2\n");
+        return;
+    }
+    if (strcmp(command, "SQUARE MODE") == 0) {
+        write_line("SQUARE MODE " SQUARE_MODE "\n");
+        return;
+    }
+    if (strcmp(command, "SQUARE BENCH") == 0) {
+        for (unsigned run = 0; run < 7; ++run) {
+            SquareBenchmark result;
+            if (!benchmark_squaring(run % 2 != 0, &result)) {
+                write_line("ERROR SQUARE PARITY\n");
+                return;
+            }
+            char line[80];
+            snprintf(line, sizeof(line), "SQUARE RUN %u %u %" PRIu32 " %" PRIu32 "\n",
+                     run + 1, result.triplets, result.scalar_cycles, result.simd_cycles);
+            write_line(line);
+        }
+        write_line("SQUARE OK\n");
         return;
     }
 

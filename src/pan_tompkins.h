@@ -14,6 +14,7 @@ enum {
     PT_DERIVATIVE_DELAY = 2,
     PT_DERIVATIVE_LIMIT = 2896,
     PT_SQUARE_SHIFT = 8,
+    PT_TRIPLET_LEADS = 3,
     PT_RR_INTERVALS = 8
 };
 
@@ -64,5 +65,15 @@ uint16_t pt_square(int16_t derivative);
  * supports at most UINT32_MAX samples. candidate is required.
  */
 bool pt_process(PtDetector *detector, int16_t sample, PtCandidate *candidate);
+
+/* Inputs are clipped derivatives. Results are in the same lead order. */
+typedef void PtSquareTriplet(const int16_t derivatives[PT_TRIPLET_LEADS],
+                             uint16_t energies[PT_TRIPLET_LEADS]);
+PtSquareTriplet pt_square_triplet_scalar;
+
+/* Consume one sample per independent detector. Bit n marks candidate n. */
+unsigned pt_process_triplet(PtDetector *const detectors[PT_TRIPLET_LEADS],
+                            const int16_t samples[PT_TRIPLET_LEADS],
+                            PtCandidate candidates[PT_TRIPLET_LEADS], PtSquareTriplet *square);
 
 #endif

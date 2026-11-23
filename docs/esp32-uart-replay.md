@@ -193,3 +193,49 @@ The matched 735-frame window measured an incremental detailed capture cost of 2,
 Host timing tests, the fusion and ring regression tests, and an independent recomputation from the board records passed. The prior flash contents were restored and verified byte-for-byte by readback. Local board records and the independent checker are in `data/timing/issue6/`.
 
 The app image SHA-256 was `43216eb31453ccc462e8bd8bd08a3746e0eb3290f64e3fd9e78b44fb59f2684e` for A and `ec3f299e2eb4a6d72d0aa18a3b95ee37598bd4da584595c2196126376afd54a4` for B. Both builds exported compilation databases. The implementation changed C and Python, so the C++ clang-tidy workflow did not apply.
+
+## Three-lead squaring and A–D parity
+
+All builds use the same detector triplet path. Each worker prepares three independent derivatives, squares the triplet, and feeds the three energies back into the corresponding detector states. A and B use scalar squaring. C and D use lanes 0–2 of the same aligned eight-lane vector, with zeros in lanes 3–7. Both kernels compute `d² >> 8` after the shared signed rounding and clipping step. Clipping to ±2,896 bounds the integration input to 0–32,761, within the signed 16-bit shifted result of `EE.VMUL.S16`. [ESP32-S3 technical reference manual](https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf)
+
+The benchmark compares and times both production kernels on the board. In each pass, every clipped derivative appears once in each lead, with offset sequences to expose lane-order errors. Seven passes alternate which kernel runs first. Cycle counts include the shared call and loop, the three input loads and output stores, and the SIMD packing, shift-register handling, and vector load and store. Input generation and output comparison occur outside the counted intervals. The board checks exact scalar/SIMD agreement before accepting the benchmark.
+
+Activate ESP-IDF 5.5.1, reserve the board, and back up the flash regions the four builds will overwrite. Use a fresh output directory for the reports. After the final run, restore the previous flash and verify it by readback.
+
+```bash
+run_dir=$(mktemp -d)
+python3 tools/incart_replay.py --offline --stop 8224 --output-dir "$run_dir"
+cc -std=c11 -O2 -Isrc src/pan_tompkins.c tools/scalar_replay.c -o "$run_dir/scalar_replay"
+
+for config in A B C D; do
+    case "$config" in A|C) core=1 ;; B|D) core=0 ;; esac
+    case "$config" in A|B) simd=OFF ;; C|D) simd=ON ;; esac
+    idf.py -C targets/esp32 -B "$run_dir/build-$config" \
+        -D SDKCONFIG="$run_dir/sdkconfig-$config" -D CMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -D SECOND_WORKER_CORE="$core" -D USE_SIMD_SQUARING="$simd" build
+    idf.py -C targets/esp32 -B "$run_dir/build-$config" -p /dev/ttyUSB0 flash
+    python3 tools/uart_replay.py /dev/ttyUSB0 --configuration "$config" \
+        --scalar-replay "$run_dir/scalar_replay" --verify-fusion --benchmark-squaring \
+        --manifest "$run_dir/I01_0_8224_scale1024.json" --score-window 257 7967 \
+        --raw-report "$run_dir/full-$config.raw" | tee "$run_dir/full-$config.log"
+done
+```
+
+### I01 hardware results
+
+All four builds used the same ESP32-S3 at 160 MHz, byte-identical SDK configurations, and the same timing capture. Both workers processed all 8,224 frames in order, with zero index errors and triplet CRCs `0f15ee60` and `83b1a809`. The replay payload SHA-256 was `0d0b8420782fcfbf59fbac91130a241d72411f22b7db2ba764402500d94b906e`.
+
+Each build matched the 298 offline candidates exactly on lead, beat location, and production frame. The separate fusion check matched all 70 fused beats, with 68 in the scored window and two of those emitted during post-roll. The fused sequence SHA-256 was `01091db5d4832b88dcad7adda2daa513afd8c4cb2b3d7b85c352891fc5831442`. All runs had zero deadline misses, input underruns, and ring overflows. Peak backlog was one frame and end backlog was zero.
+
+| Metric | A | B | C | D |
+| --- | ---: | ---: | ---: | ---: |
+| Scalar cycles per triplet, median | 74.86 | 74.85 | 74.81 | 74.86 |
+| SIMD cycles per triplet, median | 70.64 | 70.86 | 70.64 | 70.85 |
+| Frame latency p95 (µs) | 250 | 172 | 254 | 172 |
+| Worker 1 / 2 latency p95 (µs) | 247 / 247 | 167 / 170 | 251 / 248 | 167 / 170 |
+| Worker 1 / 2 CPU (ms per ECG second) | 21.980 / 22.006 | 24.431 / 24.346 | 22.462 / 22.486 | 24.409 / 24.323 |
+| Pipeline CPU (ms per ECG second) | 69.802 | 68.664 | 70.804 | 68.618 |
+
+Each pass matched all 5,793 clipped derivative values in all three lanes. The full SIMD operation used 5.3–5.6% fewer cycles. In the single matched I01 pilot, C added 4 µs to p95 and 1.001 ms of pipeline CPU per ECG second relative to A. D had the same p95 as B and used 0.046 ms less pipeline CPU per ECG second. D reduced p95 by 78 µs and pipeline CPU by 1.184 ms per ECG second relative to A. All four runs are retained as equivalent work. These pipeline effects describe one replay per build on one excerpt.
+
+The host scalar, ring, fusion, and timing regression checks passed. An independent check recomputed the board summaries from raw records and compared candidates and fused beats across A–D. The original flash was restored and verified byte-for-byte. Local records, build fingerprints, and readback checksums are in `data/timing/issue7/`. All four builds exported compilation databases. The changed source files are C and Python.
