@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Send a canonical INCART excerpt to the ESP32-S3 and verify its replay report."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+from select import select
+import sys
+import termios
+import time
+import tty
+import zlib
+
+FRAME_BYTES = 12
+TRIPLET_BYTES = FRAME_BYTES // 2
+RATE_HZ = 257
+RING_CAPACITY = 64
+MODES = ("normal", "underrun", "overflow")
+DEFAULT_MANIFEST = Path("data/replay/I01_0_7710_scale1024.json")
+
+
+def load_payload(manifest_path):
+    manifest = json.loads(manifest_path.read_text())
+    expected = {
+        "format_version": 1,
+        "bytes_per_frame": FRAME_BYTES,
+        "sample_rate_hz": RATE_HZ,
+        "code_type": "int16",
+        "byte_order": "little",
+        "lead_order": ["I", "II", "III", "aVR", "aVL", "aVF"],
+    }
+    for key, value in expected.items():
+        if manifest.get(key) != value:
+            raise ValueError(f"unsupported replay format for {key}")
+    payload = manifest_path.with_name(manifest["payload_file"]).read_bytes()
+    if (
+        not payload
+        or len(payload) % FRAME_BYTES
+        or len(payload) != manifest["frame_count"] * FRAME_BYTES
+        or len(payload) != manifest["payload_bytes"]
+    ):
+        raise ValueError("replay length does not match manifest")
+    if hashlib.sha256(payload).hexdigest() != manifest["payload_sha256"]:
+        raise ValueError("replay SHA-256 does not match manifest")
+    return payload
+
+
+def configure_port(port):
+    fcntl.ioctl(port, termios.TIOCEXCL)
+    tty.setraw(port)
+    settings = termios.tcgetattr(port)
+    settings[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+    settings[2] &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.CRTSCTS)
+    settings[2] |= termios.CS8 | termios.CLOCAL | termios.CREAD
+    settings[4] = settings[5] = termios.B115200
+    termios.tcsetattr(port, termios.TCSANOW, settings)
+    termios.tcflush(port, termios.TCIOFLUSH)
+
+
+def write_all(port, data):
+    remaining = memoryview(data)
+    deadline = time.monotonic() + 5
+    while remaining:
+        _, writable, _ = select([], [port], [], max(0, deadline - time.monotonic()))
+        if not writable:
+            raise TimeoutError("UART write timed out")
+        remaining = remaining[os.write(port, remaining):]
+
+
+def wait_for_board(port):
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        write_all(port, b"\nPING\n")
+        for line in board_lines(port, timeout=0.25):
+            if line == b"READY 1":
+                return
+    raise TimeoutError("ESP32-S3 did not acknowledge the UART handshake")
+
+
+def board_lines(port, timeout=8):
+    pending = bytearray()
+    while True:
+        readable, _, _ = select([port], [], [], timeout)
+        if not readable:
+            return
+        chunk = os.read(port, 4096)
+        if not chunk:
+            raise OSError("UART disconnected")
+        pending.extend(chunk)
+        while b"\n" in pending:
+            line, _, pending = pending.partition(b"\n")
+            yield line.strip()
+        if len(pending) > 4096:
+            raise ValueError("oversized UART response")
+
+
+def triplet_crc(payload, worker, frames):
+    crc = 0
+    offset = worker * TRIPLET_BYTES
+    for index in range(frames):
+        start = index * FRAME_BYTES + offset
+        crc = zlib.crc32(payload[start:start + TRIPLET_BYTES], crc)
+    return crc
+
+
+def verify_result(report, mode, payload, sent):
+    count = len(payload) // FRAME_BYTES
+    expected = {
+        "normal": ("OK", count, count, (count, count)),
+        "underrun": ("INPUT_UNDERRUN", 1, 1, (1, 1)),
+        "overflow": ("RING_OVERFLOW", RING_CAPACITY, RING_CAPACITY + 1, (RING_CAPACITY, 0)),
+    }
+    expected_status, expected_published, expected_sent, expected_workers = expected[mode]
+    fields = report.split()
+    if len(fields) != 12 or fields[1].decode("ascii") != expected_status:
+        raise ValueError(f"{mode} expected {expected_status}, received {report!r}")
+    published, scheduled, actual, max_late = map(int, fields[2:6])
+    if (published, sent) != (expected_published, expected_sent):
+        raise ValueError(f"{mode} published or sent frame count differs from expected")
+    last_release = published - 1 if mode == "normal" else published
+    if (
+        scheduled != last_release * 1_000_000 // RATE_HZ
+        or max_late < 0
+        or actual < 0
+        or abs(actual - scheduled) > max_late
+    ):
+        raise ValueError(f"{mode} inconsistent board timestamps")
+    if mode == "normal" and max_late >= 1_000_000 // RATE_HZ:
+        raise ValueError("a normal replay release was at least one frame period late")
+
+    for worker, expected_frames in enumerate(expected_workers):
+        offset = 6 + 3 * worker
+        frames = int(fields[offset])
+        index_errors = int(fields[offset + 1])
+        observed_crc = int(fields[offset + 2], 16)
+        expected_crc = triplet_crc(payload, worker, expected_frames)
+        if (frames, index_errors, observed_crc) != (expected_frames, 0, expected_crc):
+            raise ValueError(f"{mode} worker {worker + 1} frame count, order or CRC mismatch")
+
+
+def run_trial(port, replies, mode, payload):
+    count = len(payload) // FRAME_BYTES
+    send_limit = {"normal": count, "underrun": 1, "overflow": RING_CAPACITY + 1}[mode]
+    if count < send_limit or (mode == "underrun" and count < 2):
+        raise ValueError(f"excerpt has too few frames for {mode}")
+
+    write_all(port, f"START {count} {mode}\n".encode("ascii"))
+    sent = 0
+    for reply in replies:
+        if reply.startswith(b"GRANT "):
+            fields = reply.split()
+            if len(fields) != 2:
+                raise ValueError(f"invalid board credit: {reply!r}")
+            granted = int(fields[1])
+            end = sent + granted
+            if not 0 < granted <= 128 or end > send_limit:
+                raise ValueError(f"unexpected board credit: {reply!r}")
+            write_all(port, payload[sent * FRAME_BYTES:end * FRAME_BYTES])
+            sent = end
+        elif reply.startswith(b"RESULT "):
+            print(f"{mode} {reply.decode('ascii')}", flush=True)
+            verify_result(reply, mode, payload, sent)
+            return
+        elif reply != b"READY 1":
+            raise ValueError(f"unexpected UART reply: {reply!r}")
+    raise TimeoutError("ESP32-S3 stopped responding on UART")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("port", help="USB UART TTY, such as /dev/ttyUSB0")
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--mode", choices=(*MODES, "all"), default="normal")
+    args = parser.parse_args()
+
+    try:
+        payload = load_payload(args.manifest)
+        port = os.open(args.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            configure_port(port)
+            wait_for_board(port)
+            replies = board_lines(port)
+            for mode in MODES if args.mode == "all" else (args.mode,):
+                run_trial(port, replies, mode, payload)
+        finally:
+            os.close(port)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"UART replay failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
